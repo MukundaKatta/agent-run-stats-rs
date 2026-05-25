@@ -1,0 +1,13 @@
+[package]
+name = "agent-run-stats"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight run statistics collector for AI agent sessions"
+license = "MIT"
+repository = "https://github.com/MukundaKatta/agent-run-stats-rs"
+keywords = ["agent", "metrics", "stats", "llm", "observability"]
+categories = ["api-bindings"]
+exclude = ["target/*", ".github/*", "*.log"]
+
+[dependencies]
+serde_json = "1"
