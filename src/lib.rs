@@ -2,8 +2,11 @@
 agent-run-stats: lightweight run statistics collector for AI agent sessions.
 
 Collect tool-call records, token usage, and cost during an agent run. Produce
-a structured summary at the end. Zero overhead on the happy path — only
-allocates when you record.
+a structured summary — including per-tool counts, average and p95 latency, and
+the most-used tool — at the end. Zero overhead on the happy path: the collector
+only allocates when you record.
+
+# Example
 
 ```rust
 use agent_run_stats::RunStats;
@@ -15,7 +18,11 @@ stats.record_tokens(500, 200, 0.005);
 let summary = stats.summary();
 assert_eq!(summary.total_tool_calls, 1);
 assert_eq!(summary.tokens_in, 500);
+assert_eq!(summary.total_tokens, 700);
 assert!((summary.cost_usd - 0.005).abs() < 1e-9);
+
+// Ship the summary to your observability backend as JSON.
+let _json = summary.to_json();
 ```
 */
 
@@ -54,18 +61,31 @@ pub struct RunSummary {
     pub cost_usd: f64,
     pub tool_call_counts: HashMap<String, usize>,
     pub tool_avg_duration_ms: HashMap<String, f64>,
+    /// 95th-percentile latency (ms) per tool, computed with
+    /// nearest-rank interpolation over the recorded durations.
+    pub tool_p95_duration_ms: HashMap<String, f64>,
     pub most_used_tool: Option<String>,
+    /// Total tokens (input + output) across all recorded LLM calls.
+    pub total_tokens: u64,
 }
 
 impl RunSummary {
+    /// Serialize the summary to a [`serde_json::Value`].
+    ///
+    /// All aggregate fields are included, so the JSON is a faithful
+    /// representation of the summary that can be logged or shipped to an
+    /// observability backend.
     pub fn to_json(&self) -> Value {
         serde_json::json!({
             "duration_ms": self.duration_ms,
             "total_tool_calls": self.total_tool_calls,
             "tokens_in": self.tokens_in,
             "tokens_out": self.tokens_out,
+            "total_tokens": self.total_tokens,
             "cost_usd": self.cost_usd,
             "tool_call_counts": self.tool_call_counts,
+            "tool_avg_duration_ms": self.tool_avg_duration_ms,
+            "tool_p95_duration_ms": self.tool_p95_duration_ms,
             "most_used_tool": self.most_used_tool,
         })
     }
@@ -96,12 +116,29 @@ impl RunStats {
         }
     }
 
-    /// Record a tool call with its name and latency.
+    /// Record a tool call with its name and latency in milliseconds.
     pub fn record_tool_call(&mut self, name: &str, duration_ms: u64) {
         self.tool_calls.push(ToolCallStat {
             name: name.to_owned(),
             duration_ms,
         });
+    }
+
+    /// Record a tool call using a [`Duration`] instead of raw milliseconds.
+    ///
+    /// Convenient when timing with [`Instant::elapsed`]. Sub-millisecond
+    /// durations are rounded down to `0`.
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use agent_run_stats::RunStats;
+    ///
+    /// let mut stats = RunStats::new();
+    /// stats.record_tool_call_duration("search", Duration::from_millis(120));
+    /// assert_eq!(stats.summary().tool_avg_duration_ms["search"], 120.0);
+    /// ```
+    pub fn record_tool_call_duration(&mut self, name: &str, duration: Duration) {
+        self.record_tool_call(name, duration.as_millis() as u64);
     }
 
     /// Record token usage and cost for one LLM call.
@@ -138,13 +175,31 @@ impl RunStats {
         self.token_records.iter().map(|r| r.cost_usd).sum()
     }
 
+    /// Total tokens (input + output) across all recorded LLM calls.
+    pub fn total_tokens(&self) -> u64 {
+        self.tokens_in() + self.tokens_out()
+    }
+
+    /// Merge another collector's records into this one.
+    ///
+    /// Useful for aggregating stats collected on worker threads or in
+    /// sub-runs. The timer of `self` is left untouched.
+    pub fn merge(&mut self, other: &RunStats) {
+        self.tool_calls.extend(other.tool_calls.iter().cloned());
+        self.token_records
+            .extend(other.token_records.iter().cloned());
+    }
+
     /// Produce an aggregated summary.
     pub fn summary(&self) -> RunSummary {
         let mut counts: HashMap<String, usize> = HashMap::new();
         let mut durations: HashMap<String, Vec<u64>> = HashMap::new();
         for tc in &self.tool_calls {
             *counts.entry(tc.name.clone()).or_insert(0) += 1;
-            durations.entry(tc.name.clone()).or_default().push(tc.duration_ms);
+            durations
+                .entry(tc.name.clone())
+                .or_default()
+                .push(tc.duration_ms);
         }
         let avg_duration: HashMap<String, f64> = durations
             .iter()
@@ -154,20 +209,30 @@ impl RunStats {
             })
             .collect();
 
+        let p95_duration: HashMap<String, f64> = durations
+            .iter()
+            .map(|(k, v)| (k.clone(), percentile(v, 95.0)))
+            .collect();
+
         let most_used = counts
             .iter()
             .max_by_key(|(_, &v)| v)
             .map(|(k, _)| k.clone());
 
+        let tokens_in = self.tokens_in();
+        let tokens_out = self.tokens_out();
+
         RunSummary {
             duration_ms: self.elapsed_ms(),
             total_tool_calls: self.tool_calls.len(),
-            tokens_in: self.tokens_in(),
-            tokens_out: self.tokens_out(),
+            tokens_in,
+            tokens_out,
             cost_usd: self.cost_usd(),
             tool_call_counts: counts,
             tool_avg_duration_ms: avg_duration,
+            tool_p95_duration_ms: p95_duration,
             most_used_tool: most_used,
+            total_tokens: tokens_in + tokens_out,
         }
     }
 
@@ -176,6 +241,23 @@ impl RunStats {
         self.tool_calls.clear();
         self.token_records.clear();
     }
+}
+
+/// Nearest-rank percentile over a slice of samples.
+///
+/// `p` is a percentile in the range `[0, 100]`. Returns `0.0` for an empty
+/// slice. The input is not required to be sorted.
+fn percentile(samples: &[u64], p: f64) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let mut sorted: Vec<u64> = samples.to_vec();
+    sorted.sort_unstable();
+    let p = p.clamp(0.0, 100.0);
+    // Nearest-rank: rank = ceil(p/100 * n), 1-based, clamped to [1, n].
+    let rank = (p / 100.0 * sorted.len() as f64).ceil() as usize;
+    let idx = rank.saturating_sub(1).min(sorted.len() - 1);
+    sorted[idx] as f64
 }
 
 impl std::fmt::Debug for RunStats {
@@ -312,5 +394,94 @@ mod tests {
         let s = RunStats::new();
         let dbg = format!("{:?}", s);
         assert!(dbg.contains("RunStats"));
+    }
+
+    #[test]
+    fn record_tool_call_duration_uses_millis() {
+        let mut s = RunStats::new();
+        s.record_tool_call_duration("search", Duration::from_millis(120));
+        assert_eq!(s.tool_call_count(), 1);
+        assert_eq!(s.summary().tool_avg_duration_ms["search"], 120.0);
+    }
+
+    #[test]
+    fn record_tool_call_duration_rounds_sub_millis_to_zero() {
+        let mut s = RunStats::new();
+        s.record_tool_call_duration("fast", Duration::from_micros(500));
+        assert_eq!(s.summary().tool_avg_duration_ms["fast"], 0.0);
+    }
+
+    #[test]
+    fn total_tokens_sums_in_and_out() {
+        let mut s = RunStats::new();
+        s.record_tokens(100, 50, 0.001);
+        s.record_tokens(200, 100, 0.002);
+        assert_eq!(s.total_tokens(), 450);
+        assert_eq!(s.summary().total_tokens, 450);
+    }
+
+    #[test]
+    fn merge_combines_records() {
+        let mut a = RunStats::new();
+        a.record_tool_call("search", 10);
+        a.record_tokens(100, 50, 0.001);
+
+        let mut b = RunStats::new();
+        b.record_tool_call("search", 30);
+        b.record_tool_call("fetch", 5);
+        b.record_tokens(200, 100, 0.002);
+
+        a.merge(&b);
+        let sum = a.summary();
+        assert_eq!(sum.total_tool_calls, 3);
+        assert_eq!(sum.tool_call_counts["search"], 2);
+        assert_eq!(sum.tokens_in, 300);
+        assert_eq!(sum.tokens_out, 150);
+        assert!((sum.cost_usd - 0.003).abs() < 1e-9);
+    }
+
+    #[test]
+    fn summary_p95_single_sample() {
+        let mut s = RunStats::new();
+        s.record_tool_call("t", 42);
+        assert_eq!(s.summary().tool_p95_duration_ms["t"], 42.0);
+    }
+
+    #[test]
+    fn summary_p95_picks_high_tail() {
+        let mut s = RunStats::new();
+        for d in [10u64, 20, 30, 40, 50, 60, 70, 80, 90, 1000] {
+            s.record_tool_call("t", d);
+        }
+        // Nearest-rank p95 over 10 samples -> rank ceil(9.5) = 10 -> the max.
+        assert_eq!(s.summary().tool_p95_duration_ms["t"], 1000.0);
+    }
+
+    #[test]
+    fn percentile_empty_is_zero() {
+        assert_eq!(percentile(&[], 95.0), 0.0);
+    }
+
+    #[test]
+    fn percentile_median() {
+        // 1-based nearest rank for p50 over 5 elements -> rank ceil(2.5)=3.
+        assert_eq!(percentile(&[1, 2, 3, 4, 5], 50.0), 3.0);
+    }
+
+    #[test]
+    fn percentile_handles_unsorted_input() {
+        assert_eq!(percentile(&[5, 1, 3, 2, 4], 100.0), 5.0);
+        assert_eq!(percentile(&[5, 1, 3, 2, 4], 0.0), 1.0);
+    }
+
+    #[test]
+    fn to_json_includes_avg_and_p95() {
+        let mut s = RunStats::new();
+        s.record_tool_call("t", 10);
+        s.record_tool_call("t", 30);
+        let j = s.summary().to_json();
+        assert!(j["tool_avg_duration_ms"]["t"].as_f64().is_some());
+        assert!(j["tool_p95_duration_ms"]["t"].as_f64().is_some());
+        assert!(j["total_tokens"].as_u64().is_some());
     }
 }
